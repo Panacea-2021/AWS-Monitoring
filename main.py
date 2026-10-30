@@ -1,219 +1,78 @@
-
+import datetime
 import os
 import time
-import logging
-import json
-from datetime import datetime, timedelta, timezone
-from urllib.request import Request, urlopen
-from urllib.parse import urlencode
-
 import boto3
-from botocore.exceptions import BotoCoreError, ClientError
+import requests
 
-# --------------------------------
-# 1. CONFIGURATION
-# --------------------------------
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
-AWS_ACCESS_KEY_ID = os.environ["AWS_ACCESS_KEY_ID"]
-AWS_SECRET_ACCESS_KEY = os.environ["AWS_SECRET_ACCESS_KEY"]
-
-AWS_REGION = os.getenv("AWS_REGION", "ap-south-1")
-
-TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
-
-CHECK_INTERVAL = 7200  # 2 hours
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s"
-)
-
-logger = logging.getLogger(__name__)
-
-# --------------------------------
-# 2. AWS CONNECTION
-# --------------------------------
-
-session = boto3.Session(
-    aws_access_key_id=AWS_ACCESS_KEY_ID,
-    aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
-    region_name=AWS_REGION
-)
-
-# Cost Explorer API is accessed through us-east-1
-cost_client = session.client(
-    "ce",
-    region_name="us-east-1"
-)
-
-# --------------------------------
-# 3. TELEGRAM NOTIFICATION
-# --------------------------------
 
 def send_telegram_message(message):
+  url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+  payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
+  try:
+    response = requests.post(url, json=payload)
+    return response.json()
+  except Exception as e:
+    print(f"Error sending telegram message: {e}")
 
-    url = (
-        f"https://api.telegram.org/"
-        f"bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+
+def get_aws_cost():
+  client = boto3.client(
+      "ce",
+      region_name=os.environ.get("AWS_REGION", "us-east-1"),
+      aws_access_key_id=os.environ.get("AWS_ACCESS_KEY_ID"),
+      aws_secret_access_key=os.environ.get("AWS_SECRET_ACCESS_KEY"),
+  )
+
+  today = datetime.datetime.utcnow().strftime("%Y-%m-%d")
+  # Month start date for overall total cost
+  month_start = datetime.datetime.utcnow().strftime("%Y-%m-01")
+
+  try:
+    # 1. Overall Month-to-Date Total Cost
+    response_total = client.get_cost_and_usage(
+        TimePeriod={"Start": month_start, "End": today},
+        Granularity="MONTHLY",
+        Metrics=["UnblendedCost"],
+    )
+    total_cost = float(
+        response_total["ResultsByTime"][0]["Total"]["UnblendedCost"]["Amount"]
     )
 
-    payload = urlencode({
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message
-    }).encode("utf-8")
-
-    request = Request(
-        url,
-        data=payload,
-        method="POST"
-    )
-
-    with urlopen(request, timeout=20) as response:
-
-        result = json.loads(
-            response.read().decode("utf-8")
-        )
-
-        if not result.get("ok"):
-            raise RuntimeError("Telegram message failed")
-
-    logger.info("Telegram notification sent successfully")
-
-
-# --------------------------------
-# 4. GET AWS DAILY COST
-# --------------------------------
-
-def get_daily_aws_cost():
-
-    today = datetime.now(timezone.utc).date()
-
-    tomorrow = today + timedelta(days=1)
-
-    response = cost_client.get_cost_and_usage(
-
-        TimePeriod={
-            "Start": today.isoformat(),
-            "End": tomorrow.isoformat()
-        },
-
+    # 2. Today's Cost (Every 2 hours update kosam)
+    response_today = client.get_cost_and_usage(
+        TimePeriod={"Start": today, "End": today},
         Granularity="DAILY",
-
-        Metrics=[
-            "UnblendedCost"
-        ]
+        Metrics=["UnblendedCost"],
+    )
+    today_cost = float(
+        response_today["ResultsByTime"][0]["Total"]["UnblendedCost"]["Amount"]
     )
 
-    results = response.get("ResultsByTime", [])
+    return total_cost, today_cost
+  except Exception as e:
+    print(f"Error fetching AWS cost: {e}")
+    return 0.0, 0.0
 
-    if not results:
-        return today, 0.0, "USD"
-
-    amount_data = (
-        results[0]
-        .get("Total", {})
-        .get("UnblendedCost", {})
-    )
-
-    amount = float(amount_data.get("Amount", 0))
-
-    currency = amount_data.get("Unit", "USD")
-
-    return today, amount, currency
-
-
-# --------------------------------
-# 5. SEND COST REPORT
-# --------------------------------
 
 def send_daily_cost_report():
+  total_cost, today_cost = get_aws_cost()
+  current_time = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
 
-    today, cost, currency = get_daily_aws_cost()
+  message = (
+      "💰 *AWS COST MONITORING REPORT*\n\n"
+      f"📅 *Current Time:* {current_time}\n"
+      f"💵 *Overall Total Cost (This Month):* ${total_cost:.4f} USD\n"
+      f"⏱ *Today's Cost (Every 2 Hrs Check):* ${today_cost:.4f} USD\n\n"
+      "📊 *Service:* AWS Cost Explorer"
+  )
+  send_telegram_message(message)
 
-    current_time = datetime.now(
-        timezone.utc
-    ).strftime("%H:%M UTC")
-
-    message = f"""
-💰 AWS DAILY COST REPORT
-
-📅 Date: {today}
-
-💵 Total AWS Cost: {cost:.4f} {currency}
-
-🕒 Updated Check: {current_time}
-
-⏱ Next Notification: 2 Hours
-
-📊 Service: AWS Cost Explorer
-"""
-
-    send_telegram_message(message)
-
-    logger.info(
-        "Daily AWS cost: %.4f %s",
-        cost,
-        currency
-    )
-
-
-# --------------------------------
-# 6. MAIN MONITORING LOOP
-# --------------------------------
-
-def main():
-
-    logger.info("AWS Daily Cost Bot Started")
-
-    try:
-        send_telegram_message(
-            "✅ AWS Daily Cost Monitoring Bot Started!\n\n"
-            "Monitoring: Total AWS Daily Cost\n"
-            "Notification Frequency: Every 2 Hours"
-        )
-    except Exception:
-        logger.exception("Startup Telegram message failed")
-
-    while True:
-
-        try:
-
-            send_daily_cost_report()
-
-        except (ClientError, BotoCoreError) as error:
-
-            logger.exception("AWS API error")
-
-            try:
-                send_telegram_message(
-                    "❌ AWS Cost API Error\n"
-                    f"Error: {type(error).__name__}"
-                )
-            except Exception:
-                logger.exception("Telegram error notification failed")
-
-        except Exception as error:
-
-            logger.exception("Unexpected error")
-
-            try:
-                send_telegram_message(
-                    "❌ Monitoring Error\n"
-                    f"Error: {type(error).__name__}"
-                )
-            except Exception:
-                logger.exception("Telegram error notification failed")
-
-        logger.info("Next check in 2 hours")
-
-        time.sleep(CHECK_INTERVAL)
-
-
-# --------------------------------
-# 7. APPLICATION ENTRY POINT
-# --------------------------------
 
 if __name__ == "__main__":
-
-    main()
+  send_telegram_message("✅ AWS Cost Monitoring Bot Started as Background Worker!")
+  while True:
+    send_daily_cost_report()
+    time.sleep(7200)  # 2 Hours interval
